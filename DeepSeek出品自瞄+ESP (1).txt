@@ -1,0 +1,284 @@
+-- 合并脚本：永久显示FOV自动瞄准 + 高亮ESP (UI一直显示)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local TextService = game:GetService("TextService")
+
+local localPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- 配置设置
+local settings = {
+    AimButton = Enum.UserInputType.MouseButton2, -- 右键瞄准
+    MaxDistance = 1000,                         -- 最大瞄准距离(studs)
+    FOVSize = 350,                              -- FOV圆圈直径(像素)
+    FOVColor = Color3.fromRGB(255, 255, 255),   -- 纯白色FOV圆圈
+    AimSmoothness = 1,                          -- 直接锁定(无平滑)
+    LockOnDuration = 100000,                    -- 永久锁定
+    Priority = "Head",                          -- 瞄准优先级
+    ShowLockIndicator = true,                   -- 显示锁定指示器
+    HighlightColor = Color3.new(1, 1, 1)        -- 白色高亮
+}
+
+-- 创建FOV可视化
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "PermanentFOVAim"
+screenGui.Parent = game:GetService("CoreGui")
+
+local fovCircle = Instance.new("Frame")
+fovCircle.Name = "FOVCircle"
+fovCircle.Size = UDim2.new(0, settings.FOVSize, 0, settings.FOVSize)
+fovCircle.Position = UDim2.new(0.5, -settings.FOVSize/2, 0.5, -settings.FOVSize/2)
+fovCircle.BackgroundTransparency = 1
+fovCircle.Visible = true  -- 始终显示
+fovCircle.Parent = screenGui
+
+local circle = Instance.new("UICorner")
+circle.CornerRadius = UDim.new(1, 0)
+circle.Parent = fovCircle
+
+local border = Instance.new("UIStroke")
+border.Color = settings.FOVColor
+border.Transparency = 0  -- 完全不透明
+border.Thickness = 2     -- 更粗的边框
+border.Parent = fovCircle
+
+-- 目标锁定指示器
+local lockIndicator = Instance.new("Frame")
+lockIndicator.Name = "LockIndicator"
+lockIndicator.Size = UDim2.new(0, 15, 0, 15)  -- 稍大一些
+lockIndicator.BackgroundColor3 = Color3.fromRGB(255, 0, 0)  -- 红色更醒目
+lockIndicator.BackgroundTransparency = 0      -- 完全不透明
+lockIndicator.Visible = false
+lockIndicator.Parent = screenGui
+
+local lockCorner = Instance.new("UICorner")
+lockCorner.CornerRadius = UDim.new(1, 0)
+lockCorner.Parent = lockIndicator
+
+-- 当前锁定目标
+local currentTarget = nil
+local lastLockTime = 0
+
+-- 创建高亮和名称标签函数
+local function createPlayerESP(character, player)
+    -- 创建高亮
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "PlayerHighlight"
+    highlight.FillColor = settings.HighlightColor
+    highlight.OutlineColor = settings.HighlightColor
+    highlight.FillTransparency = 0.5  -- 半透明填充
+    highlight.OutlineTransparency = 0 -- 不透明轮廓
+    highlight.Parent = character
+
+    -- 创建名称标签
+    local billboardGui = Instance.new("BillboardGui")
+    billboardGui.Name = "PlayerNameTag"
+    billboardGui.Adornee = character:WaitForChild("Head") or character:WaitForChild("HumanoidRootPart")
+    billboardGui.Size = UDim2.new(0, 100, 0, 40)
+    billboardGui.StudsOffset = Vector3.new(0, 2.5, 0)
+    billboardGui.AlwaysOnTop = true
+    billboardGui.LightInfluence = 0
+    billboardGui.MaxDistance = 1000
+    billboardGui.Parent = character
+
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Name = "NameLabel"
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Text = player.Name
+    textLabel.TextColor3 = settings.HighlightColor
+    textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    textLabel.TextStrokeTransparency = 0
+    textLabel.TextSize = 18
+    textLabel.Font = Enum.Font.SourceSansBold
+    textLabel.Parent = billboardGui
+
+    -- 自动调整文本大小
+    local textSize = TextService:GetTextSize(player.Name, textLabel.TextSize, textLabel.Font, Vector2.new(1000, 40))
+    billboardGui.Size = UDim2.new(0, textSize.X + 10, 0, textSize.Y)
+end
+
+-- 清理ESP函数
+local function clearESP(character)
+    local highlight = character:FindFirstChild("PlayerHighlight")
+    if highlight then highlight:Destroy() end
+    
+    local nameTag = character:FindFirstChild("PlayerNameTag")
+    if nameTag then nameTag:Destroy() end
+end
+
+-- 获取视野内最佳目标
+local function findBestTarget()
+    local bestTarget = nil
+    local closestDistance = settings.FOVSize/2
+    local localCharacter = localPlayer.Character
+    
+    if not localCharacter then return nil end
+    
+    local localHead = localCharacter:FindFirstChild("Head")
+    if not localHead then return nil end
+    
+    local screenCenter = Vector2.new(camera.ViewportSize.X/2, camera.ViewportSize.Y/2)
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= localPlayer and player.Character then
+            local character = player.Character
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            
+            if humanoid and humanoid.Health > 0 then
+                local targetPart = character:FindFirstChild(settings.Priority) or 
+                                 character:FindFirstChild("HumanoidRootPart")
+                
+                if targetPart then
+                    -- 距离检查
+                    local distance = (targetPart.Position - localHead.Position).Magnitude
+                    if distance > settings.MaxDistance then continue end
+                    
+                    -- 计算屏幕位置
+                    local screenPoint = camera:WorldToViewportPoint(targetPart.Position)
+                    if screenPoint.Z < 0 then continue end -- 在屏幕后方
+                    
+                    local screenPos = Vector2.new(screenPoint.X, screenPoint.Y)
+                    local angleDistance = (screenPos - screenCenter).Magnitude
+                    
+                    -- 检查是否在FOV内
+                    if angleDistance <= settings.FOVSize/2 then
+                        -- 更新最佳目标
+                        if angleDistance < closestDistance then
+                            closestDistance = angleDistance
+                            bestTarget = {
+                                Part = targetPart,
+                                ScreenPos = screenPos,
+                                Player = player
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return bestTarget
+end
+
+-- 直接瞄准函数(无平滑)
+local function directAim(target)
+    if not target then 
+        if settings.ShowLockIndicator then
+            lockIndicator.Visible = false
+        end
+        currentTarget = nil
+        return 
+    end
+    
+    -- 更新锁定指示器位置
+    if settings.ShowLockIndicator then
+        lockIndicator.Position = UDim2.new(
+            0, target.ScreenPos.X - lockIndicator.AbsoluteSize.X/2,
+            0, target.ScreenPos.Y - lockIndicator.AbsoluteSize.Y/2
+        )
+        lockIndicator.Visible = true
+    end
+    
+    -- 直接瞄准(无平滑过渡)
+    camera.CFrame = CFrame.new(camera.CFrame.Position, target.Part.Position)
+    
+    currentTarget = target
+    lastLockTime = tick()
+end
+
+-- 输入处理
+local isAiming = false
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.UserInputType == settings.AimButton and not gameProcessed then
+        isAiming = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+    if input.UserInputType == settings.AimButton and not gameProcessed then
+        isAiming = false
+        if settings.ShowLockIndicator then
+            lockIndicator.Visible = false
+        end
+        currentTarget = nil
+    end
+end)
+
+-- 主循环
+RunService.RenderStepped:Connect(function()
+    if isAiming then
+        -- 如果已有锁定目标且在锁定持续时间内，保持锁定
+        if currentTarget and (tick() - lastLockTime) < settings.LockOnDuration then
+            directAim(currentTarget)
+        else
+            local target = findBestTarget()
+            directAim(target)
+        end
+    end
+end)
+
+-- 鼠标移动时更新FOV位置
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        local mousePos = input.Position
+        fovCircle.Position = UDim2.new(
+            0, mousePos.X - settings.FOVSize/2,
+            0, mousePos.Y - settings.FOVSize/2
+        )
+    end
+end)
+
+-- 为现有玩家添加ESP
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= localPlayer and player.Character then
+        createPlayerESP(player.Character, player)
+    end
+    
+    -- 为玩家新角色添加ESP
+    player.CharacterAdded:Connect(function(character)
+        if player ~= localPlayer then
+            createPlayerESP(character, player)
+        end
+    end)
+end
+
+-- 为新加入的玩家添加ESP
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(character)
+        if player ~= localPlayer then
+            createPlayerESP(character, player)
+        end
+    end)
+    
+    -- 如果玩家已经有角色
+    if player ~= localPlayer and player.Character then
+        createPlayerESP(player.Character, player)
+    end
+end)
+
+-- 清理本地玩家的ESP（如果存在）
+if localPlayer.Character then
+    clearESP(localPlayer.Character)
+end
+
+-- 确保本地玩家新角色不会有ESP
+localPlayer.CharacterAdded:Connect(function(character)
+    clearESP(character)
+end)
+
+-- 持续检查并修复ESP（防止被移除）
+RunService.Heartbeat:Connect(function()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= localPlayer and player.Character then
+            if not player.Character:FindFirstChild("PlayerHighlight") then
+                createPlayerESP(player.Character, player)
+            end
+        end
+    end
+end)
+
+print("永久显示FOV自动瞄准+高亮ESP脚本已加载")
